@@ -35,6 +35,9 @@ data/raw/
 *.csv
 *.parquet
 
+# ── Network dataset (>100 MB — download separately, see README) ────────────────
+network/*.inp
+
 # ── Lambda deployment packages ─────────────────────────────────────────────────
 *.zip
 layers/
