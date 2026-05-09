@@ -460,6 +460,59 @@ class WaterTwinML:
 
         logger.info(f"Artifacts saved to {self.models_dir}/")
 
+    def eval_ensemble(self, df: pd.DataFrame) -> Dict:
+        """
+        AC3 (US-05) — Load persisted ensemble artifacts and evaluate on the held-out
+        test set (same 80/20 stratified split used during training).
+
+        Threshold: F1 ≥ 0.75  (QA5, paper Table 4).
+        Writes result to evaluation_report.json via _record_eval_metric().
+        """
+        rf_path     = f'{self.models_dir}/rf_model.pkl'
+        xgb_path    = f'{self.models_dir}/xgb_model.pkl'
+        scaler_path = f'{self.models_dir}/scaler.pkl'
+        beta_path   = f'{self.models_dir}/beta.json'
+
+        for path in (rf_path, xgb_path, scaler_path, beta_path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"Artifact not found: {path}. Run --train-ensemble first."
+                )
+
+        rf_loaded  = joblib.load(rf_path)
+        xgb_loaded = joblib.load(xgb_path)
+        scaler     = joblib.load(scaler_path)
+        with open(beta_path, encoding='utf-8') as f:
+            beta = float(json.load(f)['beta'])
+
+        logger.info(f"[{self.tenant_id}] Loaded ensemble artifacts (β={beta:.2f})")
+
+        # Same split as training: test_size=0.2, random_state=42, stratify=y
+        df_feat = self._build_feature_matrix(df)
+        y = self._create_failure_labels(df_feat)
+        X = df_feat[FEATURE_COLS].values
+
+        _, X_test, _, y_test = train_test_split(
+            X, y.values, test_size=0.2, random_state=42, stratify=y
+        )
+        X_test_sc = scaler.transform(X_test)
+
+        p_rf  = rf_loaded.predict_proba(X_test_sc)[:, 1]
+        p_xgb = xgb_loaded.predict_proba(X_test_sc)[:, 1]
+        p_ens = beta * p_rf + (1.0 - beta) * p_xgb  # Ecuación 2
+
+        metrics = self._build_metrics('Ensemble_loaded', y_test, p_ens)
+        passed  = metrics.f1_score >= 0.75
+
+        logger.info(
+            f"[{self.tenant_id}] Eval — "
+            f"F1={metrics.f1_score:.3f}, "
+            f"ROC-AUC={metrics.roc_auc:.3f}, "
+            f"β={beta:.2f} → {'PASS' if passed else 'FAIL'}"
+        )
+
+        return {**asdict(metrics), 'beta': beta, 'passed': passed}
+
     def predict_failure_probability(self, X: np.ndarray) -> np.ndarray:
         """
         Ecuación 2: P(Failure|X) = β·P_RF + (1-β)·P_XGB
@@ -601,6 +654,39 @@ class WaterTwinML:
         )
 
 
+# ── CLI helpers ───────────────────────────────────────────────────────────────
+
+def _record_eval_metric(tenant_id: str, result: Dict) -> None:
+    """Upsert evaluation_report.json with the QA5 ensemble eval result."""
+    report_path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), '..', 'evaluation_report.json')
+    )
+    if os.path.exists(report_path):
+        with open(report_path, encoding='utf-8') as f:
+            report = json.load(f)
+    else:
+        report = {
+            'framework': 'WaterTwinML',
+            'paper':     'TDSE — Sistema de Gemelo Digital para Redes Hídricas',
+            'metrics':   {},
+        }
+    key = f'QA5_ensemble_f1_{tenant_id}'
+    report['metrics'][key] = {
+        'description': (
+            f'Ensemble F1 ≥ 0.75 — {tenant_id} '
+            '(US-05 AC3, Ecuación 2: β·P_RF + (1-β)·P_XGB)'
+        ),
+        'table_ref': 'Tabla 4 paper — Failure prediction F1',
+        'threshold': 'f1_score ≥ 0.75',
+        'passed':    result['passed'],
+        'result':    result,
+    }
+    report['generated_at'] = datetime.utcnow().isoformat()
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    logger.info(f"Eval metric recorded → {report_path}")
+
+
 # ── CLI entry-point ───────────────────────────────────────────────────────────
 
 def main():
@@ -626,6 +712,10 @@ def main():
     parser.add_argument(
         '--train-ensemble', action='store_true',
         help='T-04.03: Train RF+XGBoost ensemble with beta CV -- saves all artifacts',
+    )
+    parser.add_argument(
+        '--eval-ensemble', action='store_true',
+        help='AC3 (US-05): Load saved ensemble and evaluate F1/ROC-AUC on test set',
     )
     parser.add_argument(
         '--upload-models', action='store_true',
@@ -686,6 +776,24 @@ def main():
                 logger.warning(
                     f"  ✗ QA5 NOT MET: F1={ens['f1_score']:.3f} < 0.75"
                 )
+
+        if args.eval_ensemble:
+            try:
+                eval_result = ml.eval_ensemble(df)
+                _record_eval_metric(tenant_id, eval_result)
+                if eval_result['f1_score'] >= 0.75:
+                    logger.info(
+                        f"  ✓ QA5 PASSED (loaded): "
+                        f"F1={eval_result['f1_score']:.3f} ≥ 0.75  "
+                        f"ROC-AUC={eval_result['roc_auc']:.3f}"
+                    )
+                else:
+                    logger.warning(
+                        f"  ✗ QA5 FAILED (loaded): "
+                        f"F1={eval_result['f1_score']:.3f} < 0.75"
+                    )
+            except FileNotFoundError as exc:
+                logger.error(str(exc))
 
         if args.upload_models:
             ml.upload_models_to_s3()
