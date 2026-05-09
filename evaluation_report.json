@@ -1,0 +1,56 @@
+{
+  "framework": "WaterTwinML",
+  "paper": "TDSE — Sistema de Gemelo Digital para Redes Hídricas",
+  "metrics": {
+    "QA6_multi_tenant_isolation": {
+      "description": "Cross-tenant data leaks = 0 bajo carga concurrente de ambos tenants (US-07 / T-07.01, EP-05)",
+      "table_ref": "Tabla 4 / Tabla 2 paper — Multi-tenancy isolation mechanisms",
+      "threshold": "leak_count = 0  AND  inconsistent_records = 0",
+      "passed": true,
+      "result": {
+        "leak_count": 0,
+        "iterations": 100,
+        "events_tenant_a": 500,
+        "events_tenant_b": 500,
+        "concurrent_events_per_min": 1000,
+        "items_in_partition_a": 500,
+        "items_in_partition_b": 500,
+        "consistent_records": 1000,
+        "inconsistent_records": 0,
+        "inconsistency_details": [],
+        "write_errors": 0,
+        "attempt_log_sample": [
+          {
+            "iteration": 1,
+            "cross_ab_leaked": 0,
+            "cross_ba_leaked": 0
+          },
+          {
+            "iteration": 2,
+            "cross_ab_leaked": 0,
+            "cross_ba_leaked": 0
+          },
+          {
+            "iteration": 3,
+            "cross_ab_leaked": 0,
+            "cross_ba_leaked": 0
+          },
+          {
+            "iteration": 4,
+            "cross_ab_leaked": 0,
+            "cross_ba_leaked": 0
+          },
+          {
+            "iteration": 5,
+            "cross_ab_leaked": 0,
+            "cross_ba_leaked": 0
+          }
+        ],
+        "duration_seconds": 55.064,
+        "passed": true,
+        "timestamp": "2026-05-09T05:57:05.679224+00:00"
+      }
+    }
+  },
+  "generated_at": "2026-05-09T05:57:05.680780+00:00"
+}

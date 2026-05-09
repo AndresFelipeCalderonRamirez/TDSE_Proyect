@@ -49,8 +49,9 @@ class WaterTwinInfrastructure:
         self.sklearn_layer_name = 'sklearn-layer'
         self.networkx_layer_name = 'networkx-layer'
         
-        # EventBridge rule
-        self.digital_twin_rule = 'water-twin-digital-twin-rule'
+        # EventBridge rules
+        self.digital_twin_rule  = 'water-twin-digital-twin-rule'
+        self.prediction_rule    = 'water-twin-prediction-rule'
         
     def setup_all(self):
         """Setup all infrastructure components"""
@@ -75,8 +76,11 @@ class WaterTwinInfrastructure:
             
             # Step 6: Setup EventBridge rule
             self._create_eventbridge_rule()
-            
-            # Step 7: Update .env file
+
+            # Step 7: Seed pipe-network topology into DynamoDB
+            self._seed_topology()
+
+            # Step 8: Update .env file
             self._update_env_file()
             
             elapsed_time = time.time() - start_time
@@ -334,51 +338,179 @@ def lambda_handler(event, context):
                     raise
     
     def _create_eventbridge_rule(self):
-        """Create EventBridge rule for digital twin updates"""
-        logger.info("Creating EventBridge rule...")
-        
+        """Create EventBridge rules for digital twin and failure prediction"""
+        logger.info("Creating EventBridge rules...")
+
+        self._ensure_eventbridge_rule(
+            rule_name=self.digital_twin_rule,
+            schedule='rate(1 minute)',
+            description='Trigger digital twin updates every minute',
+            target_function=self.digital_twin_lambda,
+            target_id='1',
+            statement_id='eventbridge-invoke',
+        )
+        self._ensure_eventbridge_rule(
+            rule_name=self.prediction_rule,
+            schedule='rate(1 minute)',
+            description='Trigger failure prediction Lambda every minute (US-05 choreography)',
+            target_function=self.prediction_lambda,
+            target_id='1',
+            statement_id='eventbridge-invoke',
+        )
+
+    def _ensure_eventbridge_rule(
+        self,
+        rule_name: str,
+        schedule: str,
+        description: str,
+        target_function: str,
+        target_id: str,
+        statement_id: str,
+    ) -> None:
+        """Idempotent helper: create one EventBridge scheduled rule + Lambda target."""
         try:
-            self.events.describe_rule(Name=self.digital_twin_rule)
-            logger.info(f"EventBridge rule {self.digital_twin_rule} already exists")
+            self.events.describe_rule(Name=rule_name)
+            logger.info(f"EventBridge rule {rule_name} already exists")
+            return
         except ClientError as e:
-            if e.response['Error']['Code'] == 'ResourceNotFoundException':
-                logger.info(f"Creating EventBridge rule: {self.digital_twin_rule}")
-                
-                # Create rule
-                self.events.put_rule(
-                    Name=self.digital_twin_rule,
-                    ScheduleExpression='rate(1 minute)',  # Every 60 seconds
-                    State='ENABLED',
-                    Description='Trigger digital twin updates every minute'
-                )
-                
-                # Add target (digital twin lambda)
-                lambda_arn = f'arn:aws:lambda:{self.region}:{self.account_id}:function:{self.digital_twin_lambda}'
-                
-                self.events.put_targets(
-                    Rule=self.digital_twin_rule,
-                    Targets=[
-                        {
-                            'Id': '1',
-                            'Arn': lambda_arn,
-                            'RetryPolicy': {
-                                'MaximumRetryAttempts': 0
-                            }
-                        }
-                    ]
-                )
-                
-                # Add permission for EventBridge to invoke Lambda
-                self.lambda_client.add_permission(
-                    FunctionName=self.digital_twin_lambda,
-                    StatementId='eventbridge-invoke',
-                    Action='lambda:InvokeFunction',
-                    Principal='events.amazonaws.com',
-                    SourceArn=f'arn:aws:events:{self.region}:{self.account_id}:rule/{self.digital_twin_rule}'
-                )
-            else:
+            if e.response['Error']['Code'] != 'ResourceNotFoundException':
                 raise
+
+        logger.info(f"Creating EventBridge rule: {rule_name}")
+
+        self.events.put_rule(
+            Name=rule_name,
+            ScheduleExpression=schedule,
+            State='ENABLED',
+            Description=description,
+        )
+
+        lambda_arn = (
+            f'arn:aws:lambda:{self.region}:{self.account_id}'
+            f':function:{target_function}'
+        )
+        self.events.put_targets(
+            Rule=rule_name,
+            Targets=[
+                {
+                    'Id': target_id,
+                    'Arn': lambda_arn,
+                    'RetryPolicy': {'MaximumRetryAttempts': 0},
+                }
+            ],
+        )
+
+        self.lambda_client.add_permission(
+            FunctionName=target_function,
+            StatementId=statement_id,
+            Action='lambda:InvokeFunction',
+            Principal='events.amazonaws.com',
+            SourceArn=(
+                f'arn:aws:events:{self.region}:{self.account_id}:rule/{rule_name}'
+            ),
+        )
     
+    # ── Topology seeding (EP-04 / T-06.01) ───────────────────────────────────
+
+    def _seed_topology(self) -> None:
+        """
+        Write synthetic pipe-network topology for each tenant to DynamoDB.
+        Item schema:
+          PK  = tenantId
+          SK  = topology#config
+          nodes = JSON list of segment IDs (e.g. ["SEG_A_000", ...])
+          edges = JSON list of [src, dst] pairs
+        Idempotent: skips if the item already exists.
+        """
+        logger.info("Seeding pipe-network topology...")
+        dynamodb = boto3.client('dynamodb', region_name=self.region)
+
+        tenant_configs = [
+            ("tenant-A", 50),
+            ("tenant-B", 40),
+        ]
+
+        for tenant_id, n_segments in tenant_configs:
+            # Idempotency check
+            resp = dynamodb.get_item(
+                TableName=self.dynamo_table,
+                Key={
+                    "tenantId": {"S": tenant_id},
+                    "sortKey":  {"S": "topology#config"},
+                },
+            )
+            if resp.get("Item"):
+                logger.info(f"Topology for {tenant_id} already present — skipping")
+                continue
+
+            nodes, edges = self._build_synthetic_topology(n_segments, tenant_id)
+
+            dynamodb.put_item(
+                TableName=self.dynamo_table,
+                Item={
+                    "tenantId":      {"S": tenant_id},
+                    "sortKey":       {"S": "topology#config"},
+                    "nodes":         {"S": json.dumps(nodes)},
+                    "edges":         {"S": json.dumps(edges)},
+                    "n_segments":    {"N": str(n_segments)},
+                    "topology_type": {"S": "synthetic"},
+                },
+            )
+            logger.info(
+                f"Seeded topology for {tenant_id}: "
+                f"{len(nodes)} nodes, {len(edges)} edges"
+            )
+
+    @staticmethod
+    def _build_synthetic_topology(
+        n_segments: int,
+        tenant_id: str,
+    ):
+        """
+        Build a realistic water-distribution network with:
+          - One main trunk (linear backbone)
+          - Four branches distributed evenly along the trunk
+          - Cross-links between adjacent branch ends (small redundancy loops)
+
+        Segment IDs match the IoT simulator format: SEG_{A|B}_{NNN}
+
+        Tenant A (50 nodes) → 10-node trunk + 4 × 10-node branches + 3 loops
+        Tenant B (40 nodes) →  8-node trunk + 4 × 8-node branches  + 3 loops
+        """
+        short  = tenant_id.split("-")[1].upper()
+        prefix = f"SEG_{short}_"
+        nodes  = [f"{prefix}{i:03d}" for i in range(n_segments)]
+
+        edges = []
+        trunk_n      = max(5, n_segments // 5)   # 10 for A, 8 for B
+        branch_count = 4
+        branch_len   = (n_segments - trunk_n) // branch_count
+
+        # Main trunk
+        for i in range(trunk_n - 1):
+            edges.append([nodes[i], nodes[i + 1]])
+
+        # Branches: evenly distributed attachment points along the trunk
+        for b in range(branch_count):
+            attach = round((b + 1) * (trunk_n - 1) / (branch_count + 1))
+            start  = trunk_n + b * branch_len
+            end    = start + branch_len if b < branch_count - 1 else n_segments
+
+            # Trunk → branch root
+            edges.append([nodes[attach], nodes[start]])
+            # Branch internal chain
+            for i in range(start, end - 1):
+                edges.append([nodes[i], nodes[i + 1]])
+
+        # Cross-links: last node of branch b → first node of branch b+1
+        for b in range(branch_count - 1):
+            b_end        = trunk_n + (b + 1) * branch_len - 1
+            b_next_start = trunk_n + (b + 1) * branch_len
+            if b_end < n_segments and b_next_start < n_segments:
+                edges.append([nodes[b_end], nodes[b_next_start]])
+
+        return nodes, edges
+
     def _update_env_file(self):
         """Update .env file with created resource ARNs"""
         logger.info("Updating .env file...")
@@ -407,16 +539,22 @@ DIGITAL_TWIN_LAMBDA={self.digital_twin_lambda}
 SKLEARN_LAYER_ARN=
 NETWORKX_LAYER_ARN=
 
-# EventBridge Rule
+# EventBridge Rules
 DIGITAL_TWIN_RULE={self.digital_twin_rule}
+PREDICTION_RULE={self.prediction_rule}
+
+# Failure Prediction Parameters (US-05)
+PREDICTION_BATCH_SIZE=100
 
 # Model Training Parameters
 ISOLATION_FOREST_CONTAMINATION=0.02
 ISOLATION_FOREST_N_ESTIMATORS=100
 ANOMALY_THRESHOLD=0.65
 
-# Digital Twin Parameters
+# Digital Twin Parameters (EP-04 / US-06)
 RISK_PROPAGATION_ALPHA=0.7
+RANKING_TOP_K=5
+RISK_WINDOW_HOURS=2
 
 # Simulation Parameters
 ANOMALY_RATE=0.02
@@ -455,7 +593,7 @@ def main():
         print(f"DynamoDB Table: {infra.dynamo_table}")
         print(f"S3 Bucket: {infra.model_bucket}")
         print(f"Lambda Functions: {infra.anomaly_lambda}, {infra.prediction_lambda}, {infra.digital_twin_lambda}")
-        print(f"EventBridge Rule: {infra.digital_twin_rule}")
+        print(f"EventBridge Rules: {infra.digital_twin_rule}, {infra.prediction_rule}")
         print("\nNext steps:")
         print("1. Build Lambda layers using scripts in layers/ directory")
         print("2. Update .env file with layer ARNs")

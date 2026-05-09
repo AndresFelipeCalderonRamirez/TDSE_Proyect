@@ -10,7 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import logging
 
 # Configure logging
@@ -133,16 +133,19 @@ def detect_anomaly(features: np.ndarray) -> tuple:
         return 0, 0.0
 
 def write_to_dynamodb(record: Dict, is_anomaly: int, anomaly_score: float):
-    """Write results to DynamoDB"""
+    """Write results to DynamoDB.
+    processed_by_prediction=False marks the record as pending for
+    Lambda prediction (choreography pattern — US-05).
+    """
     try:
         dynamodb = boto3.client('dynamodb')
         table_name = os.getenv('DYNAMO_TABLE')
-        
+
         # Create sort key (timestamp#segmentId)
         timestamp = record['timestamp']
         segment_id = record['segment_id']
         sort_key = f"{timestamp}#{segment_id}"
-        
+
         # Prepare item
         item = {
             'tenantId': {'S': record['tenant_id']},
@@ -155,51 +158,42 @@ def write_to_dynamodb(record: Dict, is_anomaly: int, anomaly_score: float):
             'vibration': {'N': str(record['vibration'])},
             'isAnomaly': {'BOOL': bool(is_anomaly)},
             'anomalyScore': {'N': str(anomaly_score)},
-            'metadata': {'S': json.dumps(record.get('metadata', {}))}
+            'metadata': {'S': json.dumps(record.get('metadata', {}))},
+            # Choreography: prediction Lambda polls this flag every 1 min
+            'processed_by_prediction': {'BOOL': False},
         }
-        
+
         # Write to DynamoDB
         dynamodb.put_item(
             TableName=table_name,
             Item=item
         )
-        
+
         logger.info(f"Written to DynamoDB: {record['tenant_id']} - {segment_id}")
-        
+
     except Exception as e:
         logger.error(f"DynamoDB write error: {str(e)}")
 
-def invoke_prediction_lambda(record: Dict, is_anomaly: int, anomaly_score: float):
-    """Invoke failure prediction Lambda asynchronously"""
-    try:
-        if is_anomaly:  # Only invoke for anomalies
-            lambda_client = boto3.client('lambda')
-            function_name = os.getenv('PREDICTION_LAMBDA')
-            
-            # Prepare payload
-            payload = {
-                'tenant_id': record['tenant_id'],
-                'segment_id': record['segment_id'],
-                'timestamp': record['timestamp'],
-                'pressure': record['pressure'],
-                'flow': record['flow'],
-                'vibration': record['vibration'],
-                'is_anomaly': is_anomaly,
-                'anomaly_score': anomaly_score,
-                'metadata': record.get('metadata', {})
-            }
-            
-            # Invoke asynchronously
-            lambda_client.invoke(
-                FunctionName=function_name,
-                InvocationType='Event',  # Asynchronous
-                Payload=json.dumps(payload)
-            )
-            
-            logger.info(f"Invoked prediction Lambda for {record['tenant_id']} - {record['segment_id']}")
-        
-    except Exception as e:
-        logger.error(f"Prediction Lambda invocation error: {str(e)}")
+def _get_expected_tenant(stream_arn: str) -> Optional[str]:
+    """
+    Resolve the tenant_id that owns a Kinesis stream ARN.
+    ARN format: arn:aws:kinesis:{region}:{account}:stream/{stream-name}
+    Returns None when the stream is unknown or ARN is absent
+    (non-Kinesis invocations pass through without blocking).
+    """
+    if not stream_arn:
+        return None
+    stream_name = stream_arn.split('/')[-1]
+    for tid, cfg in _tenant_configs.items():
+        if cfg.get('stream_name') == stream_name:
+            return tid
+    return None
+
+
+# Removed: invoke_prediction_lambda()
+# US-05 choreography pattern: prediction Lambda is triggered by EventBridge
+# (rate 1 minute) and polls DynamoDB for processed_by_prediction=False records.
+# No direct Lambda→Lambda invocation — decoupled by design.
 
 def lambda_handler(event, context):
     """Main Lambda handler"""
@@ -222,7 +216,23 @@ def lambda_handler(event, context):
                     payload = record
                 
                 tenant_id = payload['tenant_id']
-                
+
+                # T-07.03: cross-tenant write prevention
+                # Validate that the payload tenant_id matches the Kinesis stream.
+                # A spoofed payload (e.g. tenant_id="tenant-B" on tenant-A's stream)
+                # would otherwise write into the wrong DynamoDB partition.
+                if 'kinesis' in record:
+                    expected = _get_expected_tenant(
+                        record.get('eventSourceARN', '')
+                    )
+                    if expected and tenant_id != expected:
+                        logger.warning(
+                            f"Tenant mismatch: payload tenant_id='{tenant_id}' "
+                            f"arrived on stream for '{expected}'. "
+                            f"Record dropped (EP-05 cross-tenant write guard)."
+                        )
+                        continue
+
                 # Load model if not cached
                 if tenant_id not in _tenant_configs:
                     logger.error(f"Unknown tenant: {tenant_id}")
@@ -236,12 +246,10 @@ def lambda_handler(event, context):
                 # Detect anomaly
                 is_anomaly, anomaly_score = detect_anomaly(features)
                 
-                # Write to DynamoDB
+                # Write to DynamoDB (with processed_by_prediction=False)
+                # Prediction Lambda will poll and process asynchronously (US-05)
                 write_to_dynamodb(payload, is_anomaly, anomaly_score)
-                
-                # Invoke prediction Lambda for anomalies
-                invoke_prediction_lambda(payload, is_anomaly, anomaly_score)
-                
+
                 processed_count += 1
                 if is_anomaly:
                     anomaly_count += 1
