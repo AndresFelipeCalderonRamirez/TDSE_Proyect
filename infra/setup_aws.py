@@ -189,7 +189,29 @@ class WaterTwinInfrastructure:
                 self._wait_for_dynamodb_table()
             else:
                 raise
-    
+
+        # Enable TTL regardless of whether the table was just created or already
+        # existed — idempotent call so re-runs are safe.
+        self._ensure_ttl_enabled()
+
+    def _ensure_ttl_enabled(self) -> None:
+        """Enable DynamoDB TTL on the ttl_epoch attribute (idempotent)."""
+        try:
+            self.dynamodb.update_time_to_live(
+                TableName=self.dynamo_table,
+                TimeToLiveSpecification={
+                    'Enabled': True,
+                    'AttributeName': 'ttl_epoch',
+                },
+            )
+            logger.info(f"TTL enabled on '{self.dynamo_table}' (attribute: ttl_epoch)")
+        except ClientError as e:
+            # ValidationException is raised when TTL is already enabled with the same attribute
+            if e.response['Error']['Code'] == 'ValidationException':
+                logger.info("TTL already active on 'ttl_epoch' — skipping")
+            else:
+                raise
+
     def _wait_for_dynamodb_table(self, timeout_seconds: int = 300):
         """Wait for DynamoDB table to become ACTIVE"""
         logger.info(f"Waiting for table {self.dynamo_table} to become ACTIVE...")

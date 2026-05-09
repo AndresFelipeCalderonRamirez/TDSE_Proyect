@@ -23,6 +23,7 @@ import heapq
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -113,7 +114,10 @@ def _load_segment_risks(tenant_id: str) -> Dict[str, float]:
 
     kwargs: Dict[str, Any] = {
         "TableName":               table,
-        "KeyConditionExpression":  "tenantId = :tid AND sortKey >= :cutoff",
+        # Upper bound "topology" excludes topology#config and twin_ranking_* items
+        # (both start with 't' which is lexicographically > all ISO-8601 timestamps).
+        # Without this bound, DynamoDB scans those items and wastes RCUs filtering them.
+        "KeyConditionExpression":  "tenantId = :tid AND sortKey BETWEEN :cutoff AND :upper",
         "FilterExpression": (
             "processed_by_prediction = :done "
             "AND attribute_exists(p_failure)"
@@ -122,6 +126,7 @@ def _load_segment_risks(tenant_id: str) -> Dict[str, float]:
             ":tid":    {"S": tenant_id},
             ":cutoff": {"S": cutoff},
             ":done":   {"BOOL": True},
+            ":upper":  {"S": "topology"},
         },
     }
 
@@ -223,6 +228,11 @@ def _save_ranking(
         [{"segment_id": sid, "risk_propagated": round(r, 6)} for sid, r in ranking]
     )
 
+    # TTL: expire ranking items after 7 days so the table doesn't grow unboundedly
+    # (EventBridge fires every minute → ~10 k items/week without TTL).
+    # DynamoDB TTL must be enabled on this attribute via update_time_to_live().
+    ttl_epoch = int(time.time()) + 7 * 24 * 3600
+
     dynamodb.put_item(
         TableName=table,
         Item={
@@ -232,6 +242,7 @@ def _save_ranking(
             "top_k":        {"N": str(top_k)},
             "segments":     {"S": segments_json},
             "alpha":        {"N": str(ALPHA)},
+            "ttl_epoch":    {"N": str(ttl_epoch)},
         },
     )
 
