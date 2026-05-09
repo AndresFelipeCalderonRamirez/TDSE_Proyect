@@ -29,6 +29,11 @@ python-dotenv>=1.0.0
 tqdm>=4.66.0
 colorama>=0.4.6
 
+# Water network analysis (battledim_adapter.py)
+wntr>=1.2.0
+openpyxl>=3.1.0
+pyyaml>=6.0
+
 # Development
 pytest>=7.4.0
 black>=23.0.0
