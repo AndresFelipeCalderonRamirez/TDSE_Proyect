@@ -61,8 +61,8 @@ def render_maintenance_table(records: List[Dict[str, Any]]):
 
     styled_df = (
         df.style
-        .applymap(_color_priority, subset=["Priority"])
-        .applymap(_color_pfailure, subset=["P(Failure)"])
+        .map(_color_priority, subset=["Priority"])
+        .map(_color_pfailure, subset=["P(Failure)"])
         .set_properties(**{
             "background-color": "rgba(255,255,255,0.02)",
             "border-color": "rgba(255,255,255,0.08)",
