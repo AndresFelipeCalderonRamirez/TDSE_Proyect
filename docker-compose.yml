@@ -1,0 +1,79 @@
+# =============================================================================
+# WaterTwinML — Docker Compose
+# Single Dockerfile, 4 service profiles: dashboard, evaluation, ml, simulator
+# =============================================================================
+# Usage:
+#   docker compose up -d dashboard        # Start dashboard (default)
+#   docker compose run --rm eval --all    # Run QA metrics
+#   docker compose run --rm ml --train-ensemble --tenant both
+#   docker compose run --rm sim --tenant both --duration 300
+# =============================================================================
+
+services:
+
+  dashboard:
+    build: .
+    container_name: watertwin-dashboard
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./dashboard:/app/dashboard
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - watertwin-net
+
+  eval:
+    build: .
+    container_name: watertwin-eval
+    entrypoint: ["python", "evaluation/measure_metrics.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./evaluation:/app/evaluation
+      - ./data:/app/data
+      - ./models:/app/models
+    profiles:
+      - tools
+    networks:
+      - watertwin-net
+
+  ml:
+    build: .
+    container_name: watertwin-ml
+    entrypoint: ["python", "ml/train_models.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./ml:/app/ml
+      - ./data:/app/data
+      - ./models:/app/models
+    profiles:
+      - tools
+    networks:
+      - watertwin-net
+
+  sim:
+    build: .
+    container_name: watertwin-sim
+    entrypoint: ["python", "simulator/local_simulator.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./simulator:/app/simulator
+      - ./data:/app/data
+    profiles:
+      - tools
+    networks:
+      - watertwin-net
+
+networks:
+  watertwin-net:
+    name: watertwin-network
+    driver: bridge
