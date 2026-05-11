@@ -75,6 +75,11 @@ evaluation_report.json
 Thumbs.db
 desktop.ini
 
+# ── React dashboard ────────────────────────────────────────────────────────────
+dashboard-react/node_modules/
+dashboard-react/dist/
+dashboard-react/.env
+
 # ── Logs ───────────────────────────────────────────────────────────────────────
 *.log
 logs/

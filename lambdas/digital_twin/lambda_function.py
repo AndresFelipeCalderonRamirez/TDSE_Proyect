@@ -205,6 +205,7 @@ def _propagate_risk(
 def _save_ranking(
     tenant_id: str,
     risk: Dict[str, float],
+    initial_risks: Dict[str, float],
     top_k: int = TOP_K,
 ) -> None:
     """
@@ -225,7 +226,14 @@ def _save_ranking(
 
     ranking = sorted(risk.items(), key=lambda x: x[1], reverse=True)[:top_k]
     segments_json = json.dumps(
-        [{"segment_id": sid, "risk_propagated": round(r, 6)} for sid, r in ranking]
+        [
+            {
+                "segment_id": sid,
+                "risk_propagated": round(r, 6),
+                "p_failure": round(initial_risks.get(sid, 0.0), 6),
+            }
+            for sid, r in ranking
+        ]
     )
 
     # TTL: expire ranking items after 7 days so the table doesn't grow unboundedly
@@ -283,7 +291,7 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
             )
 
             # T-06.03: persist top-k ranking
-            _save_ranking(tenant_id, propagated_risk, top_k=TOP_K)
+            _save_ranking(tenant_id, propagated_risk, initial_risks, top_k=TOP_K)
 
             results[tenant_id] = {
                 "nodes":              G.number_of_nodes(),

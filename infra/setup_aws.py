@@ -38,6 +38,7 @@ class WaterTwinInfrastructure:
         self.lambda_client = boto3.client('lambda', region_name=self.region)
         self.events = boto3.client('events', region_name=self.region)
         self.sts = boto3.client('sts', region_name=self.region)
+        self.apigw = boto3.client('apigateway', region_name=self.region)
         
         # Resource names
         self.account_id = self.sts.get_caller_identity()['Account']
@@ -50,6 +51,7 @@ class WaterTwinInfrastructure:
         self.anomaly_lambda = 'water-twin-anomaly'
         self.prediction_lambda = 'water-twin-prediction'
         self.digital_twin_lambda = 'water-twin-digital-twin'
+        self.dashboard_api_lambda = 'water-twin-dashboard-api'
         
         # Layer names
         self.sklearn_layer_name = 'sklearn-layer'
@@ -89,8 +91,11 @@ class WaterTwinInfrastructure:
             # Step 8: Seed pipe-network topology into DynamoDB
             self._seed_topology()
 
-            # Step 9: Update .env file
-            self._update_env_file()
+            # Step 9: Deploy dashboard API Lambda + API Gateway
+            api_url = self._create_dashboard_api()
+
+            # Step 10: Update .env file
+            self._update_env_file(api_url=api_url)
             
             elapsed_time = time.time() - start_time
             logger.info(f"Infrastructure setup completed in {elapsed_time:.2f} seconds")
@@ -582,7 +587,141 @@ class WaterTwinInfrastructure:
 
         return nodes, edges
 
-    def _update_env_file(self):
+    def _create_dashboard_api(self) -> str:
+        """Deploy dashboard API Lambda and API Gateway REST endpoint. Returns the invoke URL."""
+        logger.info("Creating dashboard API Lambda + API Gateway...")
+
+        # ── 1. Package the Lambda code ────────────────────────────────────────
+        src = Path(__file__).parent.parent / "lambdas" / "dashboard_api" / "lambda_function.py"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(src, "lambda_function.py")
+        zip_bytes = buf.getvalue()
+
+        # ── 2. Create or update the Lambda ───────────────────────────────────
+        try:
+            self.lambda_client.get_function(FunctionName=self.dashboard_api_lambda)
+            logger.info(f"Updating {self.dashboard_api_lambda} code...")
+            self.lambda_client.update_function_code(
+                FunctionName=self.dashboard_api_lambda,
+                ZipFile=zip_bytes,
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                logger.info(f"Creating Lambda {self.dashboard_api_lambda}...")
+                self.lambda_client.create_function(
+                    FunctionName=self.dashboard_api_lambda,
+                    Runtime="python3.12",
+                    Role=self.lab_role_arn,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": zip_bytes},
+                    Timeout=30,
+                    MemorySize=256,
+                    Environment={
+                        "Variables": {
+                            "DYNAMO_TABLE": self.dynamo_table,
+                        }
+                    },
+                )
+            else:
+                raise
+
+        # Wait for Lambda to be active
+        waiter = self.lambda_client.get_waiter("function_active_v2")
+        waiter.wait(FunctionName=self.dashboard_api_lambda)
+
+        lambda_arn = self.lambda_client.get_function(
+            FunctionName=self.dashboard_api_lambda
+        )["Configuration"]["FunctionArn"]
+
+        # ── 3. Create or reuse API Gateway REST API ───────────────────────────
+        api_name = "water-twin-dashboard-api"
+        api_id = None
+        for page in self.apigw.get_paginator("get_rest_apis").paginate():
+            for item in page["items"]:
+                if item["name"] == api_name:
+                    api_id = item["id"]
+                    logger.info(f"API Gateway '{api_name}' already exists: {api_id}")
+                    break
+            if api_id:
+                break
+
+        if not api_id:
+            logger.info(f"Creating API Gateway '{api_name}'...")
+            api_id = self.apigw.create_rest_api(
+                name=api_name,
+                description="Dashboard REST API for React frontend",
+                endpointConfiguration={"types": ["REGIONAL"]},
+            )["id"]
+
+        # ── 4. Create /{proxy+} resource with ANY method → Lambda ────────────
+        root_id = self.apigw.get_resources(restApiId=api_id)["items"][0]["id"]
+
+        # Find or create {proxy+} resource
+        resources = self.apigw.get_resources(restApiId=api_id)["items"]
+        proxy_resource = next(
+            (r for r in resources if r.get("pathPart") == "{proxy+}"), None
+        )
+        if not proxy_resource:
+            proxy_resource = self.apigw.create_resource(
+                restApiId=api_id,
+                parentId=root_id,
+                pathPart="{proxy+}",
+            )
+
+        proxy_id = proxy_resource["id"]
+        lambda_uri = (
+            f"arn:aws:apigateway:{self.region}:lambda:path/2015-03-31"
+            f"/functions/{lambda_arn}/invocations"
+        )
+
+        for method in ("ANY", "OPTIONS"):
+            try:
+                self.apigw.get_method(
+                    restApiId=api_id, resourceId=proxy_id, httpMethod=method
+                )
+            except ClientError:
+                self.apigw.put_method(
+                    restApiId=api_id,
+                    resourceId=proxy_id,
+                    httpMethod=method,
+                    authorizationType="NONE",
+                    requestParameters={"method.request.querystring.tenant_id": False},
+                )
+                self.apigw.put_integration(
+                    restApiId=api_id,
+                    resourceId=proxy_id,
+                    httpMethod=method,
+                    type="AWS_PROXY",
+                    integrationHttpMethod="POST",
+                    uri=lambda_uri,
+                )
+
+        # ── 5. Grant API Gateway permission to invoke Lambda ──────────────────
+        source_arn = (
+            f"arn:aws:execute-api:{self.region}:{self.account_id}:{api_id}/*/*/{{proxy+}}"
+        )
+        try:
+            self.lambda_client.add_permission(
+                FunctionName=self.dashboard_api_lambda,
+                StatementId="apigw-invoke",
+                Action="lambda:InvokeFunction",
+                Principal="apigateway.amazonaws.com",
+                SourceArn=source_arn,
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ResourceConflictException":
+                raise
+
+        # ── 6. Deploy to 'prod' stage ─────────────────────────────────────────
+        self.apigw.create_deployment(restApiId=api_id, stageName="prod")
+        invoke_url = (
+            f"https://{api_id}.execute-api.{self.region}.amazonaws.com/prod"
+        )
+        logger.info(f"Dashboard API deployed: {invoke_url}")
+        return invoke_url
+
+    def _update_env_file(self, api_url: str = ""):
         """Update .env file preserving existing credentials and layer ARNs."""
         logger.info("Updating .env file...")
 
@@ -618,6 +757,10 @@ TENANT_B_STREAM={self.tenant_b_stream}
 ANOMALY_LAMBDA={self.anomaly_lambda}
 PREDICTION_LAMBDA={self.prediction_lambda}
 DIGITAL_TWIN_LAMBDA={self.digital_twin_lambda}
+DASHBOARD_API_LAMBDA={self.dashboard_api_lambda}
+
+# React Dashboard API
+DASHBOARD_API_URL={api_url}
 
 # Lambda Layers
 SKLEARN_LAYER_ARN={preserved["SKLEARN_LAYER_ARN"]}

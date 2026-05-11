@@ -42,6 +42,12 @@ LAMBDAS = [
             os.getenv("NETWORKX_LAYER_ARN", ""),
         ],
     },
+    {
+        "name": os.getenv("DASHBOARD_API_LAMBDA", "water-twin-dashboard-api"),
+        "src_dir": "lambdas/dashboard_api",
+        "handler": "lambda_function.lambda_handler",
+        "layers": [],
+    },
 ]
 
 
