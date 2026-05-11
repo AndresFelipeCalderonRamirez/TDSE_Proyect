@@ -91,6 +91,7 @@ def compute_qa_metrics(
         measured = definition["pass_value"]
         status = "PASS"
 
+        report_has_value = False
         if report and "metrics" in report:
             report_key = _map_to_report_key(key)
             if report_key in report["metrics"]:
@@ -98,13 +99,21 @@ def compute_qa_metrics(
                 if key == "QA6_tenant_isolation":
                     measured = result.get("leak_count", definition["fail_value"])
                     status = "PASS" if result.get("passed") else "FAIL"
+                    report_has_value = True
                 elif key == "QA5_f1_ensemble":
                     f1 = result.get("f1", definition["pass_value"])
                     measured = round(f1, 4) if isinstance(f1, float) else f1
                     status = "PASS" if result.get("passed") else "FAIL"
+                    report_has_value = True
+                elif key == "QA4_recall_if":
+                    recall = result.get("avg_recall", definition["pass_value"])
+                    measured = round(recall, 4) if isinstance(recall, float) else recall
+                    status = "PASS" if result.get("passed") else "FAIL"
+                    report_has_value = True
 
-        fallback_val = _compute_fallback(key, tenant_id, recent_records)
-        measured = fallback_val if fallback_val is not None else measured
+        if not report_has_value:
+            fallback_val = _compute_fallback(key, tenant_id, recent_records)
+            measured = fallback_val if fallback_val is not None else measured
 
         if measured is not None:
             status = _evaluate_status(key, measured)
@@ -139,7 +148,8 @@ def _compute_fallback(
         anomalies = [r for r in parsed if r.get("isAnomaly")]
         total = len(parsed)
         if total > 0:
-            detected = sum(1 for r in anomalies if r.get("anomalyScore", 0) > 0)
+            # Z-score convention: anomalyScore is negative (more negative = more anomalous)
+            detected = sum(1 for r in anomalies if r.get("anomalyScore", 0) < 0)
             recall = detected / max(len(anomalies), 1)
             return round(recall, 4) if anomalies else None
     elif key == "QA2_throughput":

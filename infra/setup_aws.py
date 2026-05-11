@@ -5,12 +5,18 @@ Idempotent: can be run multiple times without issues
 """
 
 import boto3
+import io
 import json
 import time
 import os
 import logging
+import zipfile
+from pathlib import Path
 from botocore.exceptions import ClientError
 from typing import Dict, List, Tuple
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -77,10 +83,13 @@ class WaterTwinInfrastructure:
             # Step 6: Setup EventBridge rule
             self._create_eventbridge_rule()
 
-            # Step 7: Seed pipe-network topology into DynamoDB
+            # Step 7: Kinesis → Anomaly Lambda triggers
+            self._create_kinesis_triggers()
+
+            # Step 8: Seed pipe-network topology into DynamoDB
             self._seed_topology()
 
-            # Step 8: Update .env file
+            # Step 9: Update .env file
             self._update_env_file()
             
             elapsed_time = time.time() - start_time
@@ -318,15 +327,16 @@ class WaterTwinInfrastructure:
             (self.digital_twin_lambda, "digital_twin.lambda_handler")
         ]
         
-        # Placeholder lambda code
-        placeholder_code = '''
-def lambda_handler(event, context):
-    return {
-        'statusCode': 200,
-        'body': json.dumps('Water Twin Lambda - Placeholder')
-    }
-'''
-        
+        # Placeholder lambda code — must be packaged as a real ZIP file
+        placeholder_source = (
+            "def lambda_handler(event, context):\n"
+            "    return {'statusCode': 200, 'body': 'placeholder'}\n"
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("lambda_function.py", placeholder_source)
+        placeholder_code = buf.getvalue()
+
         for function_name, handler in functions:
             try:
                 self.lambda_client.get_function(FunctionName=function_name)
@@ -341,14 +351,17 @@ def lambda_handler(event, context):
                         Role=self.lab_role_arn,
                         Handler=handler,
                         Code={
-                            'ZipFile': placeholder_code.encode()
+                            'ZipFile': placeholder_code
                         },
                         Description=f'Water Twin {function_name}',
                         Timeout=60,
                         MemorySize=512,
                         Environment={
                             'Variables': {
-                                'AWS_DEFAULT_REGION': self.region
+                                'DYNAMO_TABLE': self.dynamo_table,
+                                'MODEL_BUCKET': self.model_bucket,
+                                'TENANT_A_STREAM': self.tenant_a_stream,
+                                'TENANT_B_STREAM': self.tenant_b_stream,
                             }
                         },
                         Tags={
@@ -359,6 +372,42 @@ def lambda_handler(event, context):
                 else:
                     raise
     
+    def _create_kinesis_triggers(self):
+        """Create Kinesis event source mappings for the Anomaly Lambda (idempotent)."""
+        logger.info("Creating Kinesis → Anomaly Lambda event source mappings...")
+
+        streams = [
+            (self.tenant_a_stream, "tenant-A"),
+            (self.tenant_b_stream, "tenant-B"),
+        ]
+
+        for stream_name, label in streams:
+            # Get the stream ARN
+            try:
+                resp = self.kinesis.describe_stream(StreamName=stream_name)
+                stream_arn = resp["StreamDescription"]["StreamARN"]
+            except ClientError as e:
+                logger.error(f"Cannot describe stream {stream_name}: {e}")
+                raise
+
+            # Check if mapping already exists
+            existing = self.lambda_client.list_event_source_mappings(
+                FunctionName=self.anomaly_lambda,
+                EventSourceArn=stream_arn,
+            )
+            if existing.get("EventSourceMappings"):
+                logger.info(f"Event source mapping for {stream_name} already exists")
+                continue
+
+            self.lambda_client.create_event_source_mapping(
+                FunctionName=self.anomaly_lambda,
+                EventSourceArn=stream_arn,
+                StartingPosition="LATEST",
+                BatchSize=100,
+                BisectBatchOnFunctionError=True,
+            )
+            logger.info(f"Created Kinesis trigger: {stream_name} → {self.anomaly_lambda} ({label})")
+
     def _create_eventbridge_rule(self):
         """Create EventBridge rules for digital twin and failure prediction"""
         logger.info("Creating EventBridge rules...")
@@ -534,11 +583,24 @@ def lambda_handler(event, context):
         return nodes, edges
 
     def _update_env_file(self):
-        """Update .env file with created resource ARNs"""
+        """Update .env file preserving existing credentials and layer ARNs."""
         logger.info("Updating .env file...")
-        
+
+        # Preserve values that must not be wiped on re-runs
+        preserved_keys = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "SKLEARN_LAYER_ARN",
+            "NETWORKX_LAYER_ARN",
+        ]
+        preserved = {k: os.getenv(k, "") for k in preserved_keys}
+
         env_content = f"""# AWS Configuration (Auto-generated)
 AWS_DEFAULT_REGION={self.region}
+AWS_ACCESS_KEY_ID={preserved["AWS_ACCESS_KEY_ID"]}
+AWS_SECRET_ACCESS_KEY={preserved["AWS_SECRET_ACCESS_KEY"]}
+AWS_SESSION_TOKEN={preserved["AWS_SESSION_TOKEN"]}
 LAB_ROLE_ARN={self.lab_role_arn}
 ACCOUNT_ID={self.account_id}
 
@@ -557,9 +619,9 @@ ANOMALY_LAMBDA={self.anomaly_lambda}
 PREDICTION_LAMBDA={self.prediction_lambda}
 DIGITAL_TWIN_LAMBDA={self.digital_twin_lambda}
 
-# Lambda Layers (To be filled after layer creation)
-SKLEARN_LAYER_ARN=
-NETWORKX_LAYER_ARN=
+# Lambda Layers
+SKLEARN_LAYER_ARN={preserved["SKLEARN_LAYER_ARN"]}
+NETWORKX_LAYER_ARN={preserved["NETWORKX_LAYER_ARN"]}
 
 # EventBridge Rules
 DIGITAL_TWIN_RULE={self.digital_twin_rule}
@@ -589,10 +651,11 @@ TENANT_B_SEGMENTS=40
 TENANT_A_ALTITUDE=2600
 TENANT_B_ALTITUDE=1500
 """
-        
-        with open('.env', 'w') as f:
+
+        env_path = Path(__file__).parent.parent / ".env"
+        with open(env_path, "w") as f:
             f.write(env_content)
-        
+
         logger.info(".env file updated successfully")
 
 def main():

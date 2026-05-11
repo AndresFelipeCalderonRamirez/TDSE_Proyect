@@ -17,7 +17,13 @@ def render_risk_heatmap(
         return
 
     parsed = parse_ranking_item(ranking_item)
-    segments = parsed.get("_parsed_segments", parsed.get("segments", []))
+    segments = parsed.get("segments", [])
+    if isinstance(segments, str):
+        import json
+        try:
+            segments = json.loads(segments)
+        except (json.JSONDecodeError, TypeError):
+            segments = []
     if not segments:
         st.info("No segments found in latest ranking.")
         return

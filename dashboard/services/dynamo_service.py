@@ -41,6 +41,7 @@ def _paginated_query(
     limit: Optional[int] = None,
     filter_expr: Optional[str] = None,
     projection: Optional[str] = None,
+    expr_attr_names: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     kwargs = {
         "TableName": table_name,
@@ -53,6 +54,8 @@ def _paginated_query(
         kwargs["FilterExpression"] = filter_expr
     if projection:
         kwargs["ProjectionExpression"] = projection
+    if expr_attr_names:
+        kwargs["ExpressionAttributeNames"] = expr_attr_names
 
     items = []
     try:
@@ -96,10 +99,11 @@ def query_recent_anomalies(
         client=client,
         table_name=table,
         key_condition="tenantId = :tid",
-        expr_attr_values={":tid": {"S": tenant_id}},
+        expr_attr_values={":tid": {"S": tenant_id}, ":true": {"BOOL": True}},
         filter_expr="isAnomaly = :true",
         limit=limit,
-        projection="sortKey, timestamp, segmentId, pressure, flow, vibration, anomalyScore, isAnomaly, p_failure",
+        projection="sortKey, #ts, segmentId, pressure, flow, vibration, anomalyScore, isAnomaly, p_failure",
+        expr_attr_names={"#ts": "timestamp"},
     )
 
 
@@ -115,7 +119,7 @@ def query_latest_ranking(tenant_id: str) -> Optional[Dict[str, Any]]:
         expr_attr_values={
             ":tid": {"S": tenant_id},
             ":start": {"S": f"twin_ranking_{cutoff}"},
-            ":end": {"S": "twin_ranking_"},
+            ":end": {"S": "twin_ranking_~"},  # ~ (ASCII 126) sorts after all ISO timestamps
         },
     )
     ranking_items = [
@@ -152,10 +156,12 @@ def query_maintenance_alerts(
             ":tid": {"S": tenant_id},
             ":cutoff": {"S": cutoff},
             ":upper": {"S": "topology"},
+            ":done": {"BOOL": True},
         },
         filter_expr="attribute_exists(p_failure) AND processed_by_prediction = :done",
         limit=limit,
-        projection="sortKey, timestamp, segmentId, pressure, flow, vibration, p_failure, anomalyScore, prediction_timestamp",
+        projection="sortKey, #ts, segmentId, pressure, flow, vibration, p_failure, anomalyScore, prediction_timestamp",
+        expr_attr_names={"#ts": "timestamp"},
     )
     return items
 

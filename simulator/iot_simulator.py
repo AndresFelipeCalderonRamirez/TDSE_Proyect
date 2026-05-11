@@ -247,12 +247,14 @@ class IoTSimulator:
                 }
                 records.append(record)
             
-            # Batch publish to Kinesis
-            self.kinesis.put_records(
-                StreamName=self.stream_name,
-                Records=records
-            )
-            
+            # Kinesis put_records limit is 500 per call
+            chunk_size = 500
+            for i in range(0, len(records), chunk_size):
+                self.kinesis.put_records(
+                    StreamName=self.stream_name,
+                    Records=records[i:i + chunk_size],
+                )
+
             logger.info(f"Published {len(records)} records to {self.stream_name}")
             return True
             

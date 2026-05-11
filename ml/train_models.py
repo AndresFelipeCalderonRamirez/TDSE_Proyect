@@ -77,7 +77,9 @@ class WaterTwinML:
         self.tenant_short = tenant_id.split('-')[1].lower()   # 'a' or 'b'
 
         self.rf_params = {
-            'n_estimators': 100,
+            'n_estimators': 30,   # reduced from 100 — keeps model < 20 MB for Lambda
+            'max_depth': 12,      # limits tree size; uncapped trees on 700k rows = 700MB+
+            'max_samples': 0.3,   # each tree sees 30% of data; sufficient for generalisation
             'class_weight': 'balanced',
             'random_state': 42,
             'n_jobs': -1,
@@ -94,7 +96,7 @@ class WaterTwinML:
         }
 
         self.isolation_forest_params = {
-            'contamination': 0.15,
+            'contamination': float(os.getenv('ISOLATION_FOREST_CONTAMINATION', '0.17')),
             'n_estimators': 100,
             'max_samples': 'auto',
             'random_state': 42,
@@ -569,11 +571,20 @@ class WaterTwinML:
             confusion_matrix=confusion_matrix(y_test, y_pred).tolist(),
         )
 
-        # Save to ml/artifacts/ path expected by the anomaly Lambda
-        if_dir = f'ml/artifacts/{self.tenant_short.upper()}'
-        os.makedirs(if_dir, exist_ok=True)
-        joblib.dump(self.isolation_forest, f'{if_dir}/isolation_forest.pkl')
-        joblib.dump(scaler_if,             f'{if_dir}/scaler.pkl')
+        # Save IF artifacts alongside ensemble artifacts so upload_models_to_s3 picks them up
+        joblib.dump(self.isolation_forest, f'{self.models_dir}/if_model.pkl')
+        joblib.dump(scaler_if,             f'{self.models_dir}/if_scaler.pkl')
+
+        # JSON stats for the anomaly Lambda (scipy-free z-score detection)
+        if_stats = {
+            'feature_cols': FEATURE_COLS,
+            'mean': scaler_if.mean_.tolist(),
+            'std': np.sqrt(scaler_if.var_).tolist(),
+            'threshold': 3.0,
+            'trained_at': datetime.utcnow().isoformat(),
+        }
+        with open(f'{self.models_dir}/if_stats.json', 'w') as f:
+            json.dump(if_stats, f, indent=2)
 
         self.metrics['isolation_forest'] = metrics
         logger.info(
@@ -592,6 +603,7 @@ class WaterTwinML:
             files = [
                 'rf_model.pkl', 'xgb_model.pkl', 'scaler.pkl',
                 'beta.json', 'beta_cv_results.json',
+                'if_model.pkl', 'if_scaler.pkl', 'if_stats.json',
             ]
             for fname in files:
                 local = f'{self.models_dir}/{fname}'
@@ -608,7 +620,7 @@ class WaterTwinML:
 
     # ── Data generation ───────────────────────────────────────────────────────
 
-    def generate_training_data(self, hours: int = 72) -> str:
+    def generate_training_data(self, hours: int = 4) -> str:
         """Generate training data via local simulator (returns JSON path)."""
         import sys
         sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -738,7 +750,7 @@ def main():
 
         # Resolve data path
         if args.generate_data:
-            data_path = ml.generate_training_data(hours=72)
+            data_path = ml.generate_training_data(hours=4)
         elif args.data_path:
             data_path = args.data_path
         else:

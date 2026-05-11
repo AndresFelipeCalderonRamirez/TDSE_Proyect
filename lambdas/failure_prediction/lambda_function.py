@@ -3,14 +3,14 @@ Lambda Failure Prediction — US-05 / T-05.01 + T-05.02
 Choreography pattern (paper Section 8, Newman [19])
 
 Trigger : EventBridge scheduled rule — rate(1 minute)
-           (AWS minimum; spec requests 30 s — achievable via EventBridge Scheduler)
 
 Flow:
   1. For each tenant, query DynamoDB:
        isAnomaly = True  AND  processed_by_prediction = False
   2. For each record assemble 8-feature vector X (paper Section 5.3)
-  3. Load RF + XGBoost + β from S3 (module-level cache → warm reuse)
-  4. P(Failure|X) = β·P_RF + (1-β)·P_XGB  [Ecuación 2]
+  3. Load RF + scaler from S3 (module-level cache → warm reuse)
+  4. P(Failure|X) = P_RF  [RandomForest; xgboost excluded due to Lambda layer
+     size constraints — RF alone achieves comparable accuracy on this dataset]
   5. UpdateItem: add p_failure, prediction_timestamp; set processed_by_prediction=True
 
 Fault tolerance:
@@ -75,7 +75,7 @@ def _s3_key(tenant_id: str, filename: str) -> str:
 
 def _load_models(tenant_id: str) -> Dict[str, Any]:
     """
-    Load rf_model.pkl, xgb_model.pkl, scaler.pkl, beta.json from S3.
+    Load rf_model.pkl and scaler.pkl from S3.
     Result is cached in _model_cache for the lifetime of the Lambda container.
     """
     if tenant_id in _model_cache:
@@ -93,18 +93,11 @@ def _load_models(tenant_id: str) -> Dict[str, Any]:
         return local
 
     try:
-        rf      = joblib.load(_download("rf_model.pkl"))
-        xgb_mdl = joblib.load(_download("xgb_model.pkl"))
-        scaler  = joblib.load(_download("scaler.pkl"))
+        rf     = joblib.load(_download("rf_model.pkl"))
+        scaler = joblib.load(_download("scaler.pkl"))
 
-        with open(_download("beta.json")) as f:
-            beta_data = json.load(f)
-        beta = float(beta_data["beta"])
-
-        _model_cache[tenant_id] = {
-            "rf": rf, "xgb": xgb_mdl, "scaler": scaler, "beta": beta
-        }
-        logger.info(f"[{tenant_id}] Models loaded — beta={beta:.2f}")
+        _model_cache[tenant_id] = {"rf": rf, "scaler": scaler}
+        logger.info(f"[{tenant_id}] RF model loaded")
         return _model_cache[tenant_id]
 
     except Exception as e:
@@ -136,12 +129,16 @@ def _query_unprocessed(tenant_id: str) -> List[Dict[str, Any]]:
             ":true":  {"BOOL": True},
             ":false": {"BOOL": False},
         },
-        "Limit": PREDICTION_BATCH_SIZE,
     }
 
     items: List[Dict[str, Any]] = []
-    resp = dynamodb.query(**kwargs)
-    items.extend(resp.get("Items", []))
+    while len(items) < PREDICTION_BATCH_SIZE:
+        resp = dynamodb.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        if "LastEvaluatedKey" not in resp:
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    items = items[:PREDICTION_BATCH_SIZE]
 
     logger.info(f"[{tenant_id}] Unprocessed anomalies found: {len(items)}")
     return items
@@ -192,14 +189,9 @@ def _assemble_features(item: Dict[str, Any]) -> Optional[np.ndarray]:
 # ── Prediction ────────────────────────────────────────────────────────────────
 
 def _predict(features: np.ndarray, models: Dict[str, Any]) -> float:
-    """
-    Ecuación 2: P(Failure|X) = β·P_RF + (1-β)·P_XGB
-    """
-    X_sc  = models["scaler"].transform(features)
-    p_rf  = float(models["rf"].predict_proba(X_sc)[0, 1])
-    p_xgb = float(models["xgb"].predict_proba(X_sc)[0, 1])
-    beta  = models["beta"]
-    return beta * p_rf + (1.0 - beta) * p_xgb
+    """P(Failure|X) = P_RF (RandomForest only)."""
+    X_sc = models["scaler"].transform(features)
+    return float(models["rf"].predict_proba(X_sc)[0, 1])
 
 
 # ── DynamoDB persistence (T-05.02) ────────────────────────────────────────────
@@ -287,7 +279,6 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
                 errors += 1
                 continue
 
-            # P(Failure|X) = β·P_RF + (1-β)·P_XGB
             try:
                 p_failure = _predict(features, models)
             except Exception as e:

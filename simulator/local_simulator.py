@@ -222,37 +222,36 @@ class LocalIoTSimulator:
     def _save_to_local_files(self, readings: List[SensorReading]) -> bool:
         """Save readings to local files instead of Kinesis"""
         try:
-            # Create data directory if it doesn't exist
             os.makedirs('data/outputs', exist_ok=True)
-            
-            # Save readings as JSON
+
+            # Stream JSON to avoid loading all records into RAM at once
             json_filename = f"data/outputs/{self.tenant_id}_sensor_data.json"
-            readings_data = []
-            
-            for reading in readings:
-                readings_data.append({
-                    'tenant_id': reading.tenant_id,
-                    'city': reading.city,
-                    'segment_id': reading.segment_id,
-                    'timestamp': reading.timestamp,
-                    'pressure': reading.pressure,
-                    'flow': reading.flow,
-                    'vibration': reading.vibration,
-                    'is_anomaly': reading.is_anomaly,
-                    'metadata': reading.metadata
-                })
-            
             with open(json_filename, 'w', encoding='utf-8') as f:
-                json.dump(readings_data, f, indent=2, ensure_ascii=False)
-            
+                f.write('[\n')
+                for i, reading in enumerate(readings):
+                    record = {
+                        'tenant_id': reading.tenant_id,
+                        'city': reading.city,
+                        'segment_id': reading.segment_id,
+                        'timestamp': reading.timestamp,
+                        'pressure': reading.pressure,
+                        'flow': reading.flow,
+                        'vibration': reading.vibration,
+                        'is_anomaly': reading.is_anomaly,
+                        'metadata': reading.metadata,
+                    }
+                    suffix = ',\n' if i < len(readings) - 1 else '\n'
+                    f.write(json.dumps(record, ensure_ascii=False) + suffix)
+                f.write(']\n')
+
             logger.info(f"Saved {len(readings)} readings to {json_filename}")
-            
-            # Save as CSV for easier analysis
+
+            # CSV (streaming)
             csv_filename = f"data/outputs/{self.tenant_id}_sensor_data.csv"
             with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = ['tenant_id', 'city', 'segment_id', 'timestamp', 'pressure', 'flow', 'vibration', 'is_anomaly']
+                fieldnames = ['tenant_id', 'city', 'segment_id', 'timestamp',
+                              'pressure', 'flow', 'vibration', 'is_anomaly']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                
                 writer.writeheader()
                 for reading in readings:
                     writer.writerow({
@@ -263,12 +262,12 @@ class LocalIoTSimulator:
                         'pressure': reading.pressure,
                         'flow': reading.flow,
                         'vibration': reading.vibration,
-                        'is_anomaly': reading.is_anomaly
+                        'is_anomaly': reading.is_anomaly,
                     })
-            
+
             logger.info(f"Saved CSV to {csv_filename}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to save local files: {str(e)}")
             return False
